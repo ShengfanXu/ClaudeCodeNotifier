@@ -1,20 +1,27 @@
-"""Notification manager: spawn Windows Toast notifications via winotify.
+"""Notification manager: sends desktop notifications and flashes VSCode.
 
-When a notification is triggered, it simultaneously:
-1. Sends a Windows Toast notification as a visual reminder
-2. Immediately flashes the VSCode taskbar button to attract attention
+Primary method: pystray balloon tip (reliable, no COM registration).
+Fallback: winotify Windows Toast (if tray icon not available).
 """
 import logging
 import threading
 from typing import Optional
 
-from winotify import Notification
-
 from src.window_activator import activate_window
 
 logger = logging.getLogger(__name__)
 
-APP_ID = "ClaudeCodeNotifier"
+# Module-level reference to tray icon, set by main.py at startup
+_tray_icon: Optional["pystray.Icon"] = None
+_tray_lock = threading.Lock()
+
+
+def set_tray_icon(icon: "pystray.Icon") -> None:
+    """Register the tray icon for balloon notifications. Called from main.py."""
+    global _tray_icon
+    with _tray_lock:
+        _tray_icon = icon
+    logger.info("Tray icon registered for notifications")
 
 
 def notify_user(
@@ -23,61 +30,59 @@ def notify_user(
     keywords: Optional[list[str]] = None,
     duration: str = "short",
 ) -> bool:
-    """Send a Windows Toast and flash the VSCode taskbar button.
+    """Send a notification and flash VSCode.
 
-    Call this from any thread — it's thread-safe.
+    Uses tray balloon as the primary notification channel,
+    with Windows Toast as fallback.
 
-    Returns True if at least one action (toast or window activation) succeeded.
+    Returns True if at least one action succeeded.
     """
     if keywords is None:
         keywords = ["Visual Studio Code", ".vscode"]
 
-    toast_ok = _send_toast(title, message, duration)
+    balloon_ok = _send_tray_balloon(title, message)
     window_ok = activate_window(keywords)
 
     if window_ok:
         logger.info("VSCode window flashed — user should see it")
     else:
-        logger.debug("VSCode window not found — toast notification is the fallback")
+        logger.debug("VSCode window not found")
 
-    return toast_ok or window_ok
+    return balloon_ok or window_ok
 
 
-def _send_toast(title: str, message: str, duration: str) -> bool:
-    """Send a Windows Toast notification. Returns True on success."""
+def _send_tray_balloon(title: str, message: str) -> bool:
+    """Send a balloon notification from the system tray icon."""
+    with _tray_lock:
+        icon = _tray_icon
+
+    if icon is None:
+        logger.warning("Tray icon not available, falling back to Toast")
+        return _send_toast_fallback(title, message)
+
     try:
-        toast = Notification(
-            app_id=APP_ID,
-            title=title,
-            msg=message,
-            duration=duration,
-        )
-        toast.show()
-        logger.info("Toast notification sent: %s", title)
+        icon.notify(message, title)
+        logger.info("Tray balloon sent: %s", title)
         return True
     except Exception:
-        logger.exception("Failed to send toast notification")
+        logger.exception("Tray balloon failed, falling back to Toast")
+        return _send_toast_fallback(title, message)
+
+
+def _send_toast_fallback(title: str, message: str) -> bool:
+    """Fallback: use winotify Toast notification."""
+    try:
+        from winotify import Notification
+
+        toast = Notification(
+            app_id="ClaudeCodeNotifier",
+            title=title,
+            msg=message,
+            duration="short",
+        )
+        toast.show()
+        logger.info("Toast fallback sent: %s", title)
+        return True
+    except Exception:
+        logger.exception("Toast fallback also failed")
         return False
-
-
-def notify_user_threadsafe(
-    title: str = "Claude Code",
-    message: str = "Needs your input",
-    keywords: Optional[list[str]] = None,
-    duration: str = "short",
-) -> bool:
-    """Send a notification from any thread.
-
-    winotify uses COM which may need STA threading. This wrapper
-    spawns a short-lived thread to avoid blocking the caller.
-    """
-    result_holder: list[bool] = []
-
-    def _do_notify() -> None:
-        result_holder.append(notify_user(title, message, keywords, duration))
-
-    thread = threading.Thread(target=_do_notify, daemon=True)
-    thread.start()
-    thread.join(timeout=5)
-
-    return result_holder[0] if result_holder else False

@@ -15,7 +15,7 @@ from aiohttp import web
 
 from src.config_loader import load_config, find_available_port
 from src.http_server import create_app, start_server, NotifyRequest
-from src.notification_manager import notify_user as send_notification
+from src.notification_manager import notify_user as send_notification, set_tray_icon
 from src.systray_manager import create_tray
 
 logger = logging.getLogger(__name__)
@@ -109,6 +109,7 @@ def main() -> None:
 
     # Start systray on main thread (blocking)
     tray = create_tray(on_quit=on_quit)
+    set_tray_icon(tray)
 
     logger.info(
         "Notifier ready on http://127.0.0.1:%d. Right-click tray icon to quit.",
