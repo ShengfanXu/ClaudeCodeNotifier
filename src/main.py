@@ -63,10 +63,8 @@ def main() -> None:
         await loop.run_in_executor(
             _notify_executor,
             lambda: send_notification(
-                title="Claude Code",
-                message="Needs your input — return to VSCode",
                 keywords=keywords,
-                duration=duration,
+                reason=req.reason,
             ),
         )
         return web.json_response({"status": "ok"})

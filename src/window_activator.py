@@ -1,10 +1,14 @@
 """Window activator: find and bring VSCode window to the foreground.
 
-Uses PowerShell to enumerate windows and pywin32 to flash/activate them.
+Uses pywin32 to enumerate windows and activate the target window.
 """
-import subprocess
 import logging
 from typing import Optional
+
+import win32gui
+import win32con
+import win32process
+import win32api
 
 logger = logging.getLogger(__name__)
 
@@ -26,129 +30,83 @@ def find_window_by_title_keywords(
     return None
 
 
-def _enum_windows_via_powershell() -> list[dict[str, str]]:
-    """Enumerate all visible main windows via PowerShell.
+def _enum_visible_windows() -> list[dict[str, object]]:
+    """Enumerate all visible top-level windows using pywin32.
 
-    Returns a list of dicts with 'title' and 'pid' keys.
+    Returns a list of dicts with 'title' and 'hwnd' keys.
     """
-    ps_script = """
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class WinAPI {
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-}
-"@
-$processes = Get-Process | Where-Object { $_.MainWindowTitle -ne '' }
-foreach ($p in $processes) {
-    $h = $p.MainWindowHandle
-    if ($h -ne [IntPtr]::Zero -and [WinAPI]::IsWindowVisible($h)) {
-        Write-Output "$($p.MainWindowTitle)|$($p.Id)"
-    }
-}
-"""
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        windows: list[dict[str, str]] = []
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if "|" in line:
-                parts = line.rsplit("|", 1)
-                if len(parts) == 2:
-                    windows.append({"title": parts[0], "pid": parts[1]})
-        return windows
-    except (subprocess.TimeoutExpired, OSError) as e:
-        logger.warning("Failed to enumerate windows: %s", e)
-        return []
+    windows: list[dict[str, object]] = []
+
+    def callback(hwnd: int, _extra: object) -> bool:
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+        title = win32gui.GetWindowText(hwnd)
+        if not title.strip():
+            return True
+        windows.append({"title": title, "hwnd": hwnd})
+        return True
+
+    win32gui.EnumWindows(callback, None)
+    return windows
 
 
 def activate_window(keywords: list[str]) -> bool:
-    """Find and activate (bring to foreground) a VSCode-compatible window.
+    """Find a VSCode window and bring it to the foreground.
 
-    Searches visible windows for titles matching any of the keywords.
-    Uses PowerShell to flash the window and bring it to the foreground.
-
-    Returns True if a matching window was found and activation was attempted.
+    Uses AttachThreadInput to work around Windows foreground restrictions.
     """
-    all_windows = _enum_windows_via_powershell()
-    titles = [w["title"] for w in all_windows if w["title"]]
+    all_windows = _enum_visible_windows()
+    titles = [str(w["title"]) for w in all_windows]
     matched_title = find_window_by_title_keywords(titles, keywords)
 
     if matched_title is None:
         logger.debug("No VSCode window found among %d windows", len(titles))
         return False
 
-    logger.info("Found VSCode window: %s", matched_title)
+    # Find the matching window handle
+    target_hwnd = None
+    for w in all_windows:
+        if w["title"] == matched_title:
+            target_hwnd = w["hwnd"]
+            break
 
-    # Escape single quotes in the title for PowerShell
-    escaped_title = matched_title.replace("'", "''")
+    if target_hwnd is None:
+        return False
 
-    activate_script = f"""
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class WinAPI {{
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")]
-    public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")]
-    public static extern bool FlashWindowEx(ref FLASHWINFO pfwi);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct FLASHWINFO {{
-        public uint cbSize;
-        public IntPtr hwnd;
-        public uint dwFlags;
-        public uint uCount;
-        public uint dwTimeout;
-    }}
-}}
-"@
-$title = '{escaped_title}'
-$h = [WinAPI]::FindWindow($null, $title)
-if ($h -ne [IntPtr]::Zero) {{
-    # Restore if minimized
-    if ([WinAPI]::IsIconic($h)) {{
-        [WinAPI]::ShowWindow($h, 9)  # SW_RESTORE
-    }}
-    # Flash taskbar button to attract attention
-    $flash = New-Object WinAPI+FLASHWINFO
-    $flash.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($flash)
-    $flash.hwnd = $h
-    $flash.dwFlags = 0x00000003  # FLASHW_TRAY | FLASHW_CAPTION
-    $flash.uCount = 3
-    $flash.dwTimeout = 0
-    [WinAPI]::FlashWindowEx([ref]$flash)
-    # Try to bring to foreground
-    [WinAPI]::SetForegroundWindow($h)
-}}
-"""
+    hwnd = int(target_hwnd)
+    logger.info("Found VSCode window: %s (hwnd=%s)", matched_title, hwnd)
+
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", activate_script],
-            capture_output=True,
-            timeout=5,
-        )
+        # Restore if minimized
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+        # Attach foreground privilege using common technique:
+        # 1. Get current foreground window's thread
+        # 2. Attach our input to it
+        # 3. Set foreground window
+        # 4. Detach
+        current_foreground = win32gui.GetForegroundWindow()
+        current_thread = win32process.GetWindowThreadProcessId(
+            current_foreground
+        )[0]
+        our_thread = win32api.GetCurrentThreadId()
+
+        if current_thread != our_thread:
+            win32process.AttachThreadInput(our_thread, current_thread, True)
+
+        win32gui.SetForegroundWindow(hwnd)
+        win32gui.SetFocus(hwnd)
+
+        # Brief flash to attract attention
+        win32gui.FlashWindow(hwnd, True)
+
+        if current_thread != our_thread:
+            win32process.AttachThreadInput(our_thread, current_thread, False)
+
+        logger.info("VSCode window activated")
         return True
-    except (subprocess.TimeoutExpired, OSError) as e:
+
+    except Exception as e:
         logger.warning("Failed to activate window: %s", e)
         return False

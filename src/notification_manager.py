@@ -1,7 +1,7 @@
-"""Notification manager: sends desktop notifications and flashes VSCode.
+"""Notification manager: clickable popup + tray balloon + VSCode flash.
 
-Primary method: pystray balloon tip (reliable, no COM registration).
-Fallback: winotify Windows Toast (if tray icon not available).
+Priority: clickable popup (tkinter) > tray balloon > Windows Toast.
+Popup: clicking it activates VSCode. Auto-dismisses after ~8 seconds.
 """
 import logging
 import threading
@@ -21,34 +21,69 @@ def set_tray_icon(icon: "pystray.Icon") -> None:
     global _tray_icon
     with _tray_lock:
         _tray_icon = icon
-    logger.info("Tray icon registered for notifications")
+    logger.info("Tray icon registered")
+
+
+# Messages by reason
+_REASON_MESSAGES = {
+    "elicitation": ("Claude Code", "Needs your choice — click to open VSCode"),
+    "permission": ("Claude Code", "Needs your permission — click to open VSCode"),
+    "stop_hook": ("Claude Code", "Task completed — click to open VSCode"),
+    "": ("Claude Code", "Needs your attention — click to open VSCode"),
+}
 
 
 def notify_user(
     title: str = "Claude Code",
-    message: str = "Needs your input",
+    message: str = "Needs your attention",
     keywords: Optional[list[str]] = None,
-    duration: str = "short",
+    reason: str = "",
 ) -> bool:
-    """Send a notification and flash VSCode.
+    """Send notification: popup (primary) + VSCode flash.
 
-    Uses tray balloon as the primary notification channel,
-    with Windows Toast as fallback.
+    If popup fails, falls back to tray balloon, then Windows Toast.
 
-    Returns True if at least one action succeeded.
+    Returns True if at least one notification channel succeeded.
     """
     if keywords is None:
         keywords = ["Visual Studio Code", ".vscode"]
 
-    balloon_ok = _send_tray_balloon(title, message)
-    window_ok = activate_window(keywords)
+    if reason and reason in _REASON_MESSAGES:
+        title, message = _REASON_MESSAGES[reason]
 
+    # 1. Clickable popup (primary — supports click-to-VSCode)
+    popup_ok = _send_popup(title, message, keywords)
+
+    # 2. VSCode window flash (immediate attention)
+    window_ok = activate_window(keywords)
     if window_ok:
-        logger.info("VSCode window flashed — user should see it")
+        logger.info("VSCode window flashed")
     else:
         logger.debug("VSCode window not found")
 
-    return balloon_ok or window_ok
+    # 3. Fallback: tray balloon (if popup failed)
+    if not popup_ok:
+        _send_tray_balloon(title, message)
+
+    return popup_ok or window_ok
+
+
+def _send_popup(
+    title: str, message: str, keywords: list[str]
+) -> bool:
+    """Show clickable tkinter popup. Returns True on success."""
+    try:
+        from src.popup_notifier import show_popup_threadsafe
+
+        return show_popup_threadsafe(
+            title=title,
+            message=message,
+            keywords=keywords,
+            timeout_ms=8000,
+        )
+    except Exception:
+        logger.debug("Popup not available, trying fallback")
+        return False
 
 
 def _send_tray_balloon(title: str, message: str) -> bool:
@@ -57,32 +92,13 @@ def _send_tray_balloon(title: str, message: str) -> bool:
         icon = _tray_icon
 
     if icon is None:
-        logger.warning("Tray icon not available, falling back to Toast")
-        return _send_toast_fallback(title, message)
+        logger.debug("Tray icon not available")
+        return False
 
     try:
         icon.notify(message, title)
         logger.info("Tray balloon sent: %s", title)
         return True
     except Exception:
-        logger.exception("Tray balloon failed, falling back to Toast")
-        return _send_toast_fallback(title, message)
-
-
-def _send_toast_fallback(title: str, message: str) -> bool:
-    """Fallback: use winotify Toast notification."""
-    try:
-        from winotify import Notification
-
-        toast = Notification(
-            app_id="ClaudeCodeNotifier",
-            title=title,
-            msg=message,
-            duration="short",
-        )
-        toast.show()
-        logger.info("Toast fallback sent: %s", title)
-        return True
-    except Exception:
-        logger.exception("Toast fallback also failed")
+        logger.exception("Tray balloon failed")
         return False
