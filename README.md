@@ -32,7 +32,7 @@ run.bat
 
 ## Hook 配置（全局生效）
 
-已在 `~/.claude/settings.json` 配置了三个 hook，对所有项目生效：
+在claude根目录 `~/.claude/settings.json` 配置三个 hook，对所有项目生效：
 
 ```json
 {
